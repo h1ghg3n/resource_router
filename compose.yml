@@ -1,0 +1,39 @@
+services:
+  resource-router:
+    build:
+      context: .
+      args:
+        JETSON_STATS_VERSION: "4.3.2"
+    environment:
+      JETROUTER_RECLAIMABLE_CACHE_FRACTION: "0.90"
+    user: "1000:1001"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:19081:19081"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - /run/jtop.sock:/run/jtop.sock:ro
+      - ./data:/app/data
+    networks:
+      - resource-plane
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:19081/health/ready', timeout=2)
+      interval: 30s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+
+networks:
+  resource-plane:
+    external: true
+    name: jetson-resource-plane
