@@ -1,0 +1,23 @@
+{
+  "memory": {
+    "RAM": {"tot": 15728763, "used": 5242880, "free": 4194815, "cached": 7340032, "buffers": 21504, "shared": 98304, "lfb": 0},
+    "SWAP": {"tot": 8388608, "used": 0, "cached": 0, "table": {}},
+    "EMC": {"online": true, "val": 0, "cur": 204000, "min": 204000, "max": 3199000}
+  },
+  "cpu": {
+    "total": {"user": 2.0, "nice": 0.0, "system": 1.25, "idle": 96.75},
+    "cpu": [
+      {"online": true, "freq": {"cur": 729600}},
+      {"online": true}, {"online": true}, {"online": true},
+      {"online": true}, {"online": true}, {"online": true}, {"online": true}
+    ]
+  },
+  "gpu": {
+    "gpu": {"type": "integrated", "status": {"load": 0, "railgate": false}, "freq": {"cur": 306000}}
+  },
+  "temperature": {
+    "cpu": {"online": true, "temp": 68.25},
+    "gpu": {"online": true, "temp": 65.5},
+    "offline": {"online": false, "temp": -256}
+  }
+}

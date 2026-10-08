@@ -1,12 +1,14 @@
 services:
   resource-router:
+    image: "${JETROUTER_IMAGE:-jetson-resource-router:local}"
     build:
       context: .
       args:
-        JETSON_STATS_VERSION: "4.3.2"
+        JETSON_STATS_VERSION: "${JETSON_STATS_VERSION:-7.2.2}"
+        VCS_REF: "${VCS_REF:-unknown}"
     environment:
       JETROUTER_RECLAIMABLE_CACHE_FRACTION: "0.90"
-    user: "1000:1001"
+    user: "${JETROUTER_UID:?Set JETROUTER_UID to the service account UID}:${JTOP_GID:?Set JTOP_GID to the host jtop socket group GID}"
     restart: unless-stopped
     ports:
       - "127.0.0.1:19081:19081"

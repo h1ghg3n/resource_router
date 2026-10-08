@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -7,7 +8,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.api.application as application_module
+from app.admission.engine import AdmissionEngine
+from app.admission.policy import AdmissionPolicy
 from app.core.errors import TelemetryUnavailableError
+from app.leases.manager import ResourceRouterManager
+from app.persistence.sqlite import SQLiteStateRepository
 from app.settings import Settings
 from app.telemetry.jtop import JtopTelemetryProvider
 from app.telemetry.provider import StaticTelemetryProvider
@@ -281,3 +286,59 @@ def test_default_application_wires_and_closes_jtop_provider(monkeypatch) -> None
 def test_invalid_interval_is_rejected(interval: float) -> None:
     with pytest.raises(ValueError, match="interval_seconds"):
         JtopTelemetryProvider(interval_seconds=interval)
+
+
+def test_jetson_stats_7_2_2_property_contract() -> None:
+    # Synthetic values using upstream 7.2.2 jtop property shapes; no hardware,
+    # captured user telemetry, or upstream source is vendored in this fixture.
+    fixture = Path(__file__).parents[1] / "fixtures" / "jetson_stats_7_2_2.json"
+    data = json.loads(fixture.read_text(encoding="utf-8"))
+    now = datetime.now(UTC)
+    client = FakeJtopClient(**data, stats={"time": now})
+    provider = JtopTelemetryProvider(client_factory=lambda _interval: client)
+    try:
+        snapshot = provider.read()
+        assert snapshot.observed_at == now
+        assert snapshot.memory_total_mb == 15360
+        assert snapshot.memory_free_mb == 4096
+        assert snapshot.memory_cached_mb == 7168
+        assert snapshot.memory_buffers_mb == 21
+        assert snapshot.memory_gpu_shared_mb == 96
+        assert snapshot.memory_lfb_mb == 0
+        assert snapshot.cpu_total_cores == snapshot.cpu_online_cores == 8
+        assert snapshot.cpu_load_percent == 3.25
+        assert snapshot.gpu_load_percent == snapshot.emc_load_percent == 0
+        assert snapshot.temperature_max_c == 68.25
+    finally:
+        provider.close()
+
+
+@pytest.mark.parametrize(
+    "connection_error",
+    [PermissionError("socket access denied"), RuntimeError("incompatible jtop version")],
+    ids=["socket-permission", "service-client-version"],
+)
+def test_jtop_connection_errors_fail_api_admission_closed(connection_error) -> None:
+    client = FakeJtopClient(memory={}, start_error=connection_error)
+    provider = JtopTelemetryProvider(client_factory=lambda _interval: client)
+    manager = ResourceRouterManager(
+        provider,
+        AdmissionEngine(AdmissionPolicy()),
+        repository=SQLiteStateRepository(Path(":memory:")),
+    )
+    with TestClient(application_module.create_app(manager)) as api:
+        assert api.get("/health/live").status_code == 200
+        assert api.get("/health/ready").status_code == 503
+        response = api.post(
+            "/v1/leases",
+            json={
+                "request_id": "018f5c30-0000-0000-0000-000000000001",
+                "client_id": "deployment-contract-test",
+                "mode": "SHARED",
+                "resources": {"memory_mb": 1024, "gpu": True, "cpu_cores": 1},
+                "ttl_seconds": 60,
+            },
+        )
+        assert response.status_code == 503
+        assert response.json()["code"] == "TELEMETRY_UNAVAILABLE"
+    assert client.close_count == client.start_count == 2
