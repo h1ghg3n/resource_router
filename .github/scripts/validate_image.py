@@ -28,7 +28,9 @@ try:
             with urllib.request.urlopen(base + "/health/live", timeout=2) as response:
                 assert response.status == 200
             break
-        except (urllib.error.URLError, TimeoutError):
+        # Docker can publish the port before Uvicorn starts accepting HTTP;
+        # an early TCP reset is another startup retry, within the same deadline.
+        except (urllib.error.URLError, TimeoutError, ConnectionError):
             time.sleep(1)
     else:
         raise AssertionError("Non-root application did not become live")
