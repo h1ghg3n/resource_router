@@ -120,21 +120,37 @@ JETROUTER_HOST=127.0.0.1 JETROUTER_PORT=19081 .venv/bin/python -m app
 
 ## Docker Compose
 
-The included image installs `jetson-stats==4.3.2`. Use that image only when the
-host `jtop.service` uses a compatible release.
+The included image installs `jetson-stats==7.2.2`, matching the JetPack 7.2 /
+L4T 39.2 recovery deployment. Match the host service release exactly; this is
+not a host upgrade command or a claim that all Jetson releases are supported.
+See [`docs/deployment-jetson-stats-7.2.2.md`](docs/deployment-jetson-stats-7.2.2.md)
+for the client contract, preflight checks, migration, and rollback procedure.
+
+Copy `.env.example` to `.env` and fill in `JETROUTER_UID` and `JTOP_GID` from the
+intended non-root service account and existing host socket. Compose deliberately
+fails when either is missing instead of guessing a device-specific group ID.
+For an older host, set `JETSON_STATS_VERSION` to its installed release and build
+a separate image; do not replace or restart the host service to match this image.
 
 ```bash
-docker network create jetson-resource-plane
+export VCS_REF="$(git rev-parse HEAD)"
+export JETROUTER_IMAGE="jetson-resource-router:${VCS_REF}"
+docker compose config --quiet
 docker compose build
-docker compose up -d
+# Start only in an approved maintenance window, after the documented preflight.
+docker compose up -d --no-build
 docker compose ps
 curl --fail http://127.0.0.1:19081/health/ready
 ```
 
 Before deployment, review these values in [`compose.yml`](compose.yml):
 
-- `user: "1000:1001"` must match the intended host UID and the GID permitted to
-  access `jtop.sock`.
+- `JETROUTER_UID` must be the intended non-root service account UID; `JTOP_GID`
+  must be the host socket's permitted numeric group, normally the `jtop` group.
+- `JETROUTER_IMAGE` selects the image tag; its default `jetson-resource-router:local`
+  is for local builds. Use a distinct tag and record the image ID for deployments.
+- `VCS_REF` records the source revision in an OCI image label. Set it before
+  building; an unset value is explicitly recorded as `unknown`.
 - `JETROUTER_RECLAIMABLE_CACHE_FRACTION=0.90` is a measured deployment override,
   not a universal Jetson default. Start with the application default of `0.5`
   unless measurements justify a higher value.
@@ -224,7 +240,7 @@ Dependencies installed by package managers retain their own licenses:
 | [jetson-stats](https://github.com/rbonghi/jetson_stats) | Jetson `jtop` telemetry client and host service | AGPL-3.0-or-later |
 
 The Apache-2.0 license for this repository does not relicense those components.
-In particular, the supplied Dockerfile installs `jetson-stats==4.3.2`, and the
+In particular, the supplied Dockerfile installs `jetson-stats==7.2.2`, and the
 Router imports its `jtop` client in-process. Anyone distributing a prebuilt
 image or another combined distribution is responsible for satisfying the
 licenses of `jetson-stats`, all other installed packages, and the base image.
