@@ -1,0 +1,9 @@
+services:
+  resource-router:
+    volumes:
+      - type: bind
+        source: "${JETROUTER_PROXY_SOCKET:?Set JETROUTER_PROXY_SOCKET to the absolute stable socket path}"
+        target: /run/jtop.sock
+        read_only: true
+        bind:
+          create_host_path: false

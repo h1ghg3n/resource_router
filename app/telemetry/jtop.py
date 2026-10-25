@@ -9,6 +9,7 @@ from threading import RLock
 from typing import Protocol
 
 from app.core.errors import TelemetryUnavailableError
+from app.telemetry.journal import Record, build_record
 from app.telemetry.snapshot import ResourceSnapshot
 
 UTC = timezone.utc
@@ -41,10 +42,17 @@ class _JtopClient(Protocol):
 
 JtopClientFactory = Callable[[float], _JtopClient]
 Clock = Callable[[], datetime]
+RecordObserver = Callable[[Record], None]
 
 
 class JtopTelemetryProvider:
-    """Normalize a long-lived jetson-stats client into Router telemetry."""
+    """Own and replace the Router's single long-lived jetson-stats client.
+
+    Reads are serialized and normally reuse the active client generation. A
+    failed generation is retired before one immediate replacement is attempted;
+    a second failure is exposed as unavailable without further retries. Closing
+    the provider permanently prevents new clients and closes the active one.
+    """
 
     def __init__(
         self,
@@ -52,59 +60,123 @@ class JtopTelemetryProvider:
         interval_seconds: float = 1.0,
         client_factory: JtopClientFactory | None = None,
         clock: Clock | None = None,
+        record_observer: RecordObserver | None = None,
     ) -> None:
+        """Bind a shared client factory, finite positive interval and optional best-effort record observer; create no client until a read."""
         if not isfinite(interval_seconds) or interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive and finite")
         self._interval_seconds = interval_seconds
         self._client_factory = client_factory or _create_jtop_client
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._record_observer = record_observer
         self._client: _JtopClient | None = None
+        self._client_generation = 0
         self._closed = False
         self._lock = RLock()
 
     def read(self) -> ResourceSnapshot:
+        """Return a fresh normalized snapshot, replacing one failed generation.
+
+        The provider must be open and the client must yield valid jtop memory
+        data. A failed generation is closed and replaced exactly once during
+        this call. If the replacement also fails, telemetry remains unavailable
+        and no stale snapshot or additional retry is returned.
+        """
         with self._lock:
             if self._closed:
                 raise TelemetryUnavailableError("jtop telemetry provider is closed")
 
-            try:
-                client = self._ensure_client()
-                if not client.ok(spin=True):
-                    raise RuntimeError("jtop client is not running")
+            for attempt in range(2):
+                try:
+                    return self._read_client()
+                except Exception as error:
+                    self._discard_client()
+                    if attempt == 0:
+                        continue
+                    if isinstance(error, TelemetryUnavailableError):
+                        raise
+                    detail = str(error).strip() or type(error).__name__
+                    raise TelemetryUnavailableError(
+                        "jtop telemetry is unavailable after client generation "
+                        f"{self._client_generation}: {detail}"
+                    ) from error
 
-                memory = _required_dict_like(client.memory, "memory")
-                cpu = _optional_dict_like(client, "cpu")
-                gpu = _optional_dict_like(client, "gpu")
-                temperature = _optional_dict_like(client, "temperature")
-                stats = _optional_dict_like(client, "stats")
-                return _normalize_snapshot(
-                    memory=memory,
-                    cpu=cpu,
-                    gpu=gpu,
-                    temperature=temperature,
-                    observed_at=_observed_at(stats.get("time"), self._clock),
-                )
-            except TelemetryUnavailableError:
-                self._discard_client()
-                raise
-            except Exception as error:
-                self._discard_client()
-                detail = str(error).strip() or type(error).__name__
-                raise TelemetryUnavailableError(
-                    f"jtop telemetry is unavailable: {detail}"
-                ) from error
+            raise AssertionError("bounded jtop client replacement did not terminate")
+
+    def try_read(self) -> ResourceSnapshot | None:
+        """Return a journal sample only when the shared client lock is immediately free.
+
+        This background-only boundary never waits behind admission and contains
+        telemetry failures as a skipped sample. It may replace one failed jtop
+        generation using the same bounded policy as a foreground read.
+        """
+
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            if self._closed:
+                return None
+            for attempt in range(2):
+                try:
+                    return self._read_client()
+                except Exception:
+                    self._discard_client()
+                    if attempt == 1:
+                        return None
+            return None
+        finally:
+            self._lock.release()
 
     def close(self) -> None:
+        """Permanently close the provider and retire its active client."""
         with self._lock:
             if self._closed:
                 return
             self._closed = True
             self._discard_client()
 
+    def _read_client(self) -> ResourceSnapshot:
+        """Normalize one sample and best-effort offer its sanitized record."""
+        client = self._ensure_client()
+        if not client.ok(spin=True):
+            raise RuntimeError("jtop client is not running")
+
+        memory = _required_dict_like(client.memory, "memory")
+        cpu = _optional_dict_like(client, "cpu")
+        gpu = _optional_dict_like(client, "gpu")
+        temperature = _optional_dict_like(client, "temperature")
+        stats = _optional_dict_like(client, "stats")
+        snapshot = _normalize_snapshot(
+            memory=memory,
+            cpu=cpu,
+            gpu=gpu,
+            temperature=temperature,
+            observed_at=_observed_at(stats.get("time"), self._clock),
+        )
+        observer = self._record_observer
+        if observer is not None:
+            try:
+                observer(
+                    build_record(
+                        snapshot=snapshot,
+                        memory=memory,
+                        cpu=cpu,
+                        gpu=gpu,
+                        temperature=temperature,
+                        stats=stats,
+                        generation=self._client_generation,
+                    )
+                )
+            except Exception:
+                pass
+        return snapshot
+
     def _ensure_client(self) -> _JtopClient:
+        """Return the active client or start one new owned generation."""
         if self._client is not None:
             return self._client
 
+        self._client_generation += 1
         client = self._client_factory(self._interval_seconds)
         try:
             client.start()
@@ -115,6 +187,7 @@ class JtopTelemetryProvider:
         return client
 
     def _discard_client(self) -> None:
+        """Detach the active generation before best-effort client cleanup."""
         client = self._client
         self._client = None
         if client is not None:
@@ -172,6 +245,16 @@ def _normalize_snapshot(
 def _cpu_metrics(
     cpu: Mapping[str, object],
 ) -> tuple[int | None, int | None, float | None]:
+    """Return core counts and the mean busy percentage of all online cores.
+
+    Use the per-core interval idle percentages, never jtop's aggregate: some
+    versions retain the previous delta instead of the previous cumulative CPU
+    counters there. Require explicit online flags and valid idle percentages
+    for every online core; partial, malformed, or all-offline data yields null
+    load rather than a misleading aggregate fallback. No host reads or state
+    changes occur here; admission continues to own core capacity accounting.
+    """
+
     raw_cores = cpu.get("cpu")
     if (
         not isinstance(raw_cores, Sequence)
@@ -183,8 +266,7 @@ def _cpu_metrics(
     else:
         total_cores = len(raw_cores)
         online_values = [
-            core.get("online") if isinstance(core, Mapping) else None
-            for core in raw_cores
+            core.get("online") if isinstance(core, Mapping) else None for core in raw_cores
         ]
         online_cores = (
             sum(value is True for value in online_values)
@@ -192,9 +274,13 @@ def _cpu_metrics(
             else None
         )
 
-    aggregate = _nested_mapping(cpu, "total")
-    idle_percent = None if aggregate is None else _percentage(aggregate.get("idle"))
-    load_percent = None if idle_percent is None else 100.0 - idle_percent
+    load_percent = None
+    if online_cores:
+        idle_values = [
+            _percentage(core.get("idle")) for core in raw_cores if core["online"] is True
+        ]
+        if all(value is not None for value in idle_values):
+            load_percent = sum(100.0 - value for value in idle_values) / online_cores
     return total_cores, online_cores, load_percent
 
 

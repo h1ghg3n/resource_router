@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime
 from math import ceil
 from uuid import UUID
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from pydantic import ValidationError
 
+from app import __version__
 from app.admission.engine import AdmissionEngine
 from app.admission.policy import AdmissionPolicy
 from app.api.schemas import (
@@ -30,6 +33,10 @@ from app.api.schemas import (
     ReservationStatusResponse,
     ReservationWindowResponse,
     RouterStatusResponse,
+    TelemetryCurrentResponse,
+    TelemetryHistoryResponse,
+    TelemetryHistorySampleResponse,
+    TelemetryHistoryWriterResponse,
     TelemetryResponse,
 )
 from app.core.enums import AcquisitionStatus
@@ -59,9 +66,10 @@ from app.core.models import (
     ReservationRequest,
     ResourceClaim,
 )
-from app.leases.manager import ResourceRouterManager
+from app.leases.manager import ResourceRouterManager, RouterStatusSnapshot
 from app.persistence.sqlite import SQLiteStateRepository
 from app.settings import Settings
+from app.telemetry.journal import MAX_HISTORY_LIMIT, TelemetryJournal
 from app.telemetry.jtop import JtopTelemetryProvider
 
 
@@ -69,33 +77,70 @@ def create_app(
     manager: ResourceRouterManager | None = None,
     *,
     settings: Settings | None = None,
+    telemetry_history: TelemetryJournal | None = None,
 ) -> FastAPI:
+    """Build the Router API and optional fail-open embedded telemetry journal.
+
+    An injected manager participates in app lifespan and is closed on shutdown.
+    The default path owns one
+    jtop provider, SQLite repository, and—only when configured—one bounded
+    journal thread. ``telemetry_history`` may inject that journal for an
+    isolated reader test; it is sampled only when this factory also owns the
+    provider. Lifespan shutdown closes the journal before provider and storage
+    resources; journal failures never change admission decisions. No host control
+    or lease-policy expansion is introduced by either telemetry read route.
+    """
+
     runtime_settings = settings or Settings.from_environment()
-    service = manager or ResourceRouterManager(
-        JtopTelemetryProvider(),
-        AdmissionEngine(
-            AdmissionPolicy(
-                reclaimable_cache_fraction=(
-                    runtime_settings.reclaimable_cache_fraction
-                )
+    journal = telemetry_history
+    provider: JtopTelemetryProvider | None = None
+    if manager is None:
+        if journal is None and runtime_settings.telemetry_journal_path is not None:
+            journal = TelemetryJournal(
+                runtime_settings.telemetry_journal_path,
+                idle_interval_seconds=(runtime_settings.telemetry_idle_interval_seconds),
+                active_interval_seconds=(runtime_settings.telemetry_active_interval_seconds),
+                max_bytes=runtime_settings.telemetry_max_bytes,
+                backup_count=runtime_settings.telemetry_backup_count,
+                session_id=runtime_settings.telemetry_session_id,
             )
-        ),
-        repository=SQLiteStateRepository(runtime_settings.database_path),
-    )
+        provider = (
+            JtopTelemetryProvider()
+            if journal is None
+            else JtopTelemetryProvider(record_observer=journal.offer)
+        )
+        service = ResourceRouterManager(
+            provider,
+            AdmissionEngine(
+                AdmissionPolicy(
+                    reclaimable_cache_fraction=(runtime_settings.reclaimable_cache_fraction)
+                )
+            ),
+            repository=SQLiteStateRepository(runtime_settings.database_path),
+        )
+    else:
+        service = manager
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """Start optional sampling and close owned resources in safe order."""
+
+        if journal is not None and provider is not None:
+            journal.start(provider.try_read)
         try:
             yield
         finally:
+            if journal is not None:
+                journal.close()
             service.close()
 
     app = FastAPI(
         title="Jetson Resource Router",
-        version="1.0.0",
+        version=__version__,
         lifespan=lifespan,
     )
     app.state.router = service
+    app.state.telemetry_journal = journal
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
@@ -212,88 +257,104 @@ def create_app(
 
     @app.get("/v1/status", response_model=RouterStatusResponse)
     async def get_status() -> RouterStatusResponse:
+        """Map the normal reconciled manager status to the unchanged v1 response; admit no new workload."""
+        return _router_status_response(await service.status(), service)
+
+    @app.get(
+        "/v2/telemetry/current",
+        response_model=TelemetryCurrentResponse,
+        operation_id="getTelemetryCurrent",
+        summary="Get the current Router and Jetson telemetry snapshot",
+        tags=["Telemetry"],
+        responses={503: {"description": "Fresh telemetry is unavailable"}},
+    )
+    async def get_telemetry_current() -> TelemetryCurrentResponse | JSONResponse:
+        """Return one fresh, timestamped snapshot for tools and LLM clients.
+
+        This read-only endpoint exposes the same admission-safe values as v1
+        status with an explicit observation timestamp and schema version. It
+        returns 503 instead of a null metric payload when telemetry is stale or
+        unavailable and never admits work or controls a workload. As with v1
+        status, the manager may reconcile ordinary lease/reservation expiry.
+        """
+
         current = await service.status()
-        snapshot = current.telemetry
-        telemetry = (
-            None
-            if snapshot is None or current.telemetry_age_ms is None
-            else TelemetryResponse(
-                age_ms=current.telemetry_age_ms,
-                memory=MemoryTelemetryResponse(
-                    total_mb=snapshot.memory_total_mb,
-                    free_mb=snapshot.memory_free_mb,
-                    cached_mb=snapshot.memory_cached_mb,
-                    buffers_mb=snapshot.memory_buffers_mb,
-                    gpu_shared_mb=snapshot.memory_gpu_shared_mb,
-                    lfb_mb=snapshot.memory_lfb_mb,
-                ),
-                cpu=CpuTelemetryResponse(
-                    total_cores=snapshot.cpu_total_cores,
-                    online_cores=snapshot.cpu_online_cores,
-                    load_percent=snapshot.cpu_load_percent,
-                ),
-                gpu=GpuTelemetryResponse(
-                    load_percent=snapshot.gpu_load_percent,
-                ),
-                emc=EmcTelemetryResponse(
-                    load_percent=snapshot.emc_load_percent,
-                ),
-                temperature_max_c=snapshot.temperature_max_c,
+        if current.telemetry is None or current.telemetry_age_ms is None:
+            retry_ms = service.policy.unavailable_retry_after_ms
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "code": "TELEMETRY_UNAVAILABLE",
+                    "message": "fresh telemetry is unavailable",
+                    "retry_after_ms": retry_ms,
+                },
+                headers={"Retry-After": str(ceil(retry_ms / 1000))},
             )
+        return TelemetryCurrentResponse(
+            observed_at=current.telemetry.observed_at,
+            router=_router_status_response(current, service),
         )
-        capacity = (
-            None
-            if current.capacity is None
-            else CapacityResponse(
-                allocatable_memory_mb=current.capacity.allocatable_memory_mb,
-                committed_memory_mb=current.capacity.committed_memory_mb,
-                effective_available_memory_mb=(
-                    current.capacity.effective_available_memory_mb
-                ),
-                allocatable_cpu_cores=current.capacity.allocatable_cpu_cores,
-                committed_cpu_cores=current.capacity.committed_cpu_cores,
+
+    @app.get(
+        "/v2/telemetry/history",
+        response_model=TelemetryHistoryResponse,
+        operation_id="getTelemetryHistory",
+        summary="Get bounded recent telemetry samples",
+        tags=["Telemetry"],
+        responses={503: {"description": "Telemetry history is not configured"}},
+    )
+    def get_telemetry_history(
+        since: datetime | None = Query(
+            default=None,
+            description="Inclusive timezone-aware lower observation time",
+        ),
+        before: datetime | None = Query(
+            default=None,
+            description="Exclusive timezone-aware upper observation time",
+        ),
+        limit: int = Query(default=120, ge=1, le=MAX_HISTORY_LIMIT),
+    ) -> TelemetryHistoryResponse | JSONResponse:
+        """Return recent schema-v1 samples in chronological order.
+
+        File reads run in FastAPI's worker pool and never acquire admission or
+        writer locks. The fixed journal path, maximum result count, strict time
+        bounds, allowlisted response model, and partial-result metadata keep the
+        endpoint safe for local visualization and LLM tool consumers.
+        """
+
+        if journal is None:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "code": "TELEMETRY_HISTORY_UNAVAILABLE",
+                    "message": "telemetry history is not configured",
+                },
             )
-        )
-        owner = None
-        if current.exclusive_owner is not None:
-            if current.exclusive_owner.owner_type == "LEASE":
-                owner = ExclusiveOwnerResponse(
-                    type="LEASE",
-                    lease_id=UUID(current.exclusive_owner.owner_id),
-                )
-            else:
-                owner = ExclusiveOwnerResponse(
-                    type="RESERVATION",
-                    reservation_id=current.exclusive_owner.owner_id,
-                )
-        reservation = (
-            None
-            if current.reservation is None
-            else ReservationStatusResponse(
-                reservation_id=current.reservation.reservation_id,
-                status=current.reservation.status,
-                drain_at=current.reservation.drain_at,
-                lease_deadline=current.reservation.lease_deadline,
-                start_at=current.reservation.start_at,
-                end_at=current.reservation.end_at,
+        try:
+            history = journal.read_history(since=since, before=before, limit=limit)
+        except ValueError as error:
+            return JSONResponse(
+                status_code=422,
+                content={"code": "VALIDATION_ERROR", "message": str(error)},
             )
-        )
-        return RouterStatusResponse(
-            state=current.state,
-            exclusive_owner=owner,
-            telemetry=telemetry,
-            capacity=capacity,
-            leases=LeaseCountsResponse(
-                shared=current.shared_leases,
-                exclusive=current.exclusive_leases,
-            ),
-            reservation=reservation,
-            limits=LimitsResponse(
-                max_lease_ttl_seconds=service.policy.max_lease_ttl_seconds,
-                minimum_reservation_drain_before_seconds=(
-                    service.minimum_reservation_drain_before_seconds
-                ),
-            ),
+
+        samples: list[TelemetryHistorySampleResponse] = []
+        skipped_records = history.skipped_records
+        for record in history.records:
+            try:
+                samples.append(TelemetryHistorySampleResponse.model_validate(record))
+            except ValidationError:
+                skipped_records += 1
+        writer = TelemetryHistoryWriterResponse.model_validate(journal.stats())
+        return TelemetryHistoryResponse(
+            count=len(samples),
+            limit=limit,
+            truncated=history.truncated,
+            partial=history.read_errors > 0 or skipped_records > 0,
+            read_errors=history.read_errors,
+            skipped_records=skipped_records,
+            writer=writer,
+            samples=samples,
         )
 
     @app.get("/health/live", response_model=HealthLiveResponse)
@@ -315,6 +376,95 @@ def create_app(
         return HealthReadyResponse()
 
     return app
+
+
+def _router_status_response(
+    current: RouterStatusSnapshot,
+    service: ResourceRouterManager,
+) -> RouterStatusResponse:
+    """Map one immutable manager snapshot to the stable public v1 status shape.
+
+    The input is already reconciled under the manager's ownership boundary. The
+    mapping performs no telemetry read, persistence access, or state mutation;
+    missing optional telemetry and capacity remain explicit nulls.
+    """
+
+    snapshot = current.telemetry
+    telemetry = (
+        None
+        if snapshot is None or current.telemetry_age_ms is None
+        else TelemetryResponse(
+            age_ms=current.telemetry_age_ms,
+            memory=MemoryTelemetryResponse(
+                total_mb=snapshot.memory_total_mb,
+                free_mb=snapshot.memory_free_mb,
+                cached_mb=snapshot.memory_cached_mb,
+                buffers_mb=snapshot.memory_buffers_mb,
+                gpu_shared_mb=snapshot.memory_gpu_shared_mb,
+                lfb_mb=snapshot.memory_lfb_mb,
+            ),
+            cpu=CpuTelemetryResponse(
+                total_cores=snapshot.cpu_total_cores,
+                online_cores=snapshot.cpu_online_cores,
+                load_percent=snapshot.cpu_load_percent,
+            ),
+            gpu=GpuTelemetryResponse(load_percent=snapshot.gpu_load_percent),
+            emc=EmcTelemetryResponse(load_percent=snapshot.emc_load_percent),
+            temperature_max_c=snapshot.temperature_max_c,
+        )
+    )
+    capacity = (
+        None
+        if current.capacity is None
+        else CapacityResponse(
+            allocatable_memory_mb=current.capacity.allocatable_memory_mb,
+            committed_memory_mb=current.capacity.committed_memory_mb,
+            effective_available_memory_mb=current.capacity.effective_available_memory_mb,
+            allocatable_cpu_cores=current.capacity.allocatable_cpu_cores,
+            committed_cpu_cores=current.capacity.committed_cpu_cores,
+        )
+    )
+    owner = None
+    if current.exclusive_owner is not None:
+        if current.exclusive_owner.owner_type == "LEASE":
+            owner = ExclusiveOwnerResponse(
+                type="LEASE",
+                lease_id=UUID(current.exclusive_owner.owner_id),
+            )
+        else:
+            owner = ExclusiveOwnerResponse(
+                type="RESERVATION",
+                reservation_id=current.exclusive_owner.owner_id,
+            )
+    reservation = (
+        None
+        if current.reservation is None
+        else ReservationStatusResponse(
+            reservation_id=current.reservation.reservation_id,
+            status=current.reservation.status,
+            drain_at=current.reservation.drain_at,
+            lease_deadline=current.reservation.lease_deadline,
+            start_at=current.reservation.start_at,
+            end_at=current.reservation.end_at,
+        )
+    )
+    return RouterStatusResponse(
+        state=current.state,
+        exclusive_owner=owner,
+        telemetry=telemetry,
+        capacity=capacity,
+        leases=LeaseCountsResponse(
+            shared=current.shared_leases,
+            exclusive=current.exclusive_leases,
+        ),
+        reservation=reservation,
+        limits=LimitsResponse(
+            max_lease_ttl_seconds=service.policy.max_lease_ttl_seconds,
+            minimum_reservation_drain_before_seconds=(
+                service.minimum_reservation_drain_before_seconds
+            ),
+        ),
+    )
 
 
 def _map_domain_error(error: ResourceRouterError) -> tuple[int, str]:

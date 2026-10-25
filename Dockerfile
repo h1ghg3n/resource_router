@@ -2,9 +2,11 @@ FROM python:3.10-slim
 
 ARG JETSON_STATS_VERSION=7.2.2
 ARG VCS_REF=unknown
+ARG VERSION=0.2.0
 
 LABEL org.opencontainers.image.source="https://github.com/h1ghg3n/resource_router" \
-    org.opencontainers.image.revision="${VCS_REF}"
+    org.opencontainers.image.revision="${VCS_REF}" \
+    org.opencontainers.image.version="${VERSION}"
 
 WORKDIR /app
 
