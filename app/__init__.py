@@ -1,2 +1,2 @@
 """Jetson Resource Router application package."""
-"""Jetson Resource Router."""
+__version__ = "0.2.0"

@@ -1,0 +1,12 @@
+[Unit]
+Description=Stable Resource Router proxy to the current jtop socket
+
+[Service]
+UMask=0077
+ExecStartPre=/usr/bin/rm -f %t/jetson-jtop-proxy.sock
+ExecStart=/usr/bin/sg jtop -c "umask 0077; exec /usr/bin/systemd-socket-activate --listen=%t/jetson-jtop-proxy.sock --fdname=proxy /usr/lib/systemd/systemd-socket-proxyd --connections-max=64 /run/jtop.sock"
+ExecStartPost=/usr/bin/bash "%h/.local/libexec/jetson-resource-router/restrict-jtop-proxy-socket.sh"
+ExecStopPost=/usr/bin/rm -f %t/jetson-jtop-proxy.sock
+
+[Install]
+WantedBy=default.target

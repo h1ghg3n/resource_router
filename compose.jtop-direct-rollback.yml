@@ -1,0 +1,9 @@
+services:
+  resource-router:
+    volumes:
+      - type: bind
+        source: /run/jtop.sock
+        target: /run/jtop.sock
+        read_only: true
+        bind:
+          create_host_path: false

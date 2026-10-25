@@ -12,7 +12,9 @@ subprocess.run([
     "docker", "run", "--rm", "--user", "11001:11002", IMAGE,
     "python", "-c",
     "import app.api.application; from importlib.metadata import version; "
-    "assert version('jetson-stats') == '7.2.2'",
+    "from app import __version__; "
+    "assert version('jetson-stats') == '7.2.2'; "
+    "assert version('jetson-resource-router') == __version__ == '0.2.0'",
 ], check=True)
 
 try:

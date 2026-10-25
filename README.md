@@ -16,6 +16,12 @@ windows.
 The complete v1 protocol is documented in
 [`docs/api-contract-v1.md`](docs/api-contract-v1.md).
 
+Release **0.2.0** adds bounded read-only telemetry and jtop recovery while keeping
+the v1 lease/reservation contract and SQLite schema unchanged. See the
+[changelog](CHANGELOG.md), [telemetry API](docs/telemetry-api-v2.md), and optional
+[stable jtop proxy](docs/jtop-recovery.md). The default direct-socket deployment
+is preserved; none of the host examples are installed or executed automatically.
+
 ## What it provides
 
 - Atomic `SHARED` and node-wide `EXCLUSIVE` lease admission.
@@ -169,6 +175,22 @@ a local filesystem.
 | `JETROUTER_PORT` | `19081` | HTTP port |
 | `JETROUTER_DATABASE_PATH` | `data/jetrouter.sqlite3` | SQLite state path |
 | `JETROUTER_RECLAIMABLE_CACHE_FRACTION` | `0.5` | Fraction of reported file cache counted as conservatively reclaimable; must be between `0` and `1` |
+| `JETROUTER_TELEMETRY_JOURNAL_PATH` | unset | Opt in to a local JSONL telemetry journal; otherwise history returns503 |
+| `JETROUTER_TELEMETRY_IDLE_SECONDS` | `30` | Positive finite idle sampling interval |
+| `JETROUTER_TELEMETRY_ACTIVE_SECONDS` | `1` | Positive finite interval while recent GPU activity is observed |
+| `JETROUTER_TELEMETRY_MAX_BYTES` | `16777216` | Maximum bytes per journal file; an oversized single record disables only the writer |
+| `JETROUTER_TELEMETRY_BACKUP_COUNT` | `4` | Rotated files retained, from1 through16, in addition to the current file |
+| `JETROUTER_TELEMETRY_SESSION_ID` | `resource-router` | Nonsecret correlation label,1–64 letters/digits/dot/underscore/hyphen |
+
+For example, explicitly set `JETROUTER_TELEMETRY_JOURNAL_PATH` to a writable
+file inside the existing data mount to enable history. No extra container or
+database migration is needed. The background journal uses the same jtop provider;
+it skips a busy provider lock, but SDK work after acquiring it can still delay
+a competing reader. Disk writes and history queries do not take the admission lock.
+Writer failures are isolated from admission and readiness. A record is capped at
+64KiB and history at1000 samples; total default retention is at most80MiB.
+The journal may read allowlisted `/proc/meminfo` and current cgroup namespace
+counters. Those are observations of that namespace, not all workload containers.
 
 Admission policy defaults such as memory reserves, pressure thresholds, lease
 TTL, and reservation safety margin are defined in

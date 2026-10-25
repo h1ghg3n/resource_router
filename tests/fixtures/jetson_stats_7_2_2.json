@@ -5,11 +5,11 @@
     "EMC": {"online": true, "val": 0, "cur": 204000, "min": 204000, "max": 3199000}
   },
   "cpu": {
-    "total": {"user": 2.0, "nice": 0.0, "system": 1.25, "idle": 96.75},
+    "total": {"user": 2.0, "nice": 0.0, "system": 1.25, "idle": 5.5},
     "cpu": [
-      {"online": true, "freq": {"cur": 729600}},
-      {"online": true}, {"online": true}, {"online": true},
-      {"online": true}, {"online": true}, {"online": true}, {"online": true}
+      {"online": true, "idle": 96.75, "freq": {"cur": 729600}},
+      {"online": true, "idle": 96.75}, {"online": true, "idle": 96.75}, {"online": true, "idle": 96.75},
+      {"online": true, "idle": 96.75}, {"online": true, "idle": 96.75}, {"online": true, "idle": 96.75}, {"online": true, "idle": 96.75}
     ]
   },
   "gpu": {
